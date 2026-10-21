@@ -1,0 +1,683 @@
+"""End-to-end orchestration: prepare -> block -> features -> two-stage LightGBM -> decide.
+
+Artefacts (under ``work_dir``):
+    prepared/               normalised parquet per split/source/country
+    blocks/{split}_{country}.npz   candidate pairs + pair features (+ labels for train)
+    emb/                    cached embeddings (optional channel)
+    model/stage1.txt, model/stage2.txt, model/meta.json
+    eval/holdout_s1_ids.txt         S1 entities held out from training (shared with v1 eval)
+    eval/holdout_predictions_v2.tsv predictions of this pipeline on the holdout
+    eval/holdout_report_v2.json     metrics on the holdout
+"""
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import random
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+from . import blocking as B
+from .config import Config
+from .data import list_countries, load_ground_truth, load_pool, load_prepared, log, prepare_source, read_tsv
+from .features import GROUP_FEATURES, PAIR_FEATURES, PairFeaturizer, group_features
+from .metrics import detailed_report, macro_f05
+
+MAX_PER_SOURCE = 6  # ground truth never exceeds 5 (S2) / 6 (S3) matches per S1 entity
+
+
+# --------------------------------------------------------------------------------------
+# prepare
+# --------------------------------------------------------------------------------------
+
+def run_prepare(cfg: Config, splits=("train", "test")) -> None:
+    cfg.ensure_dirs()
+    prepared = cfg.paths()["prepared"]
+    for split in splits:
+        for source in (1, 2, 3):
+            tsv = cfg.data_dir / split / f"{split}_source{source}.tsv"
+            if not tsv.exists():
+                log(f"prepare: missing {tsv} (skipped)")
+                continue
+            prepare_source(tsv, prepared, split, source, cfg.n_jobs)
+
+
+# --------------------------------------------------------------------------------------
+# blocking + features for one country
+# --------------------------------------------------------------------------------------
+
+def _holdout_ids(cfg: Config, truth: dict[str, set[str]]) -> set[str]:
+    """Deterministic holdout of S1 entities (identical to v1's split when seed=42/8%)."""
+    path = cfg.paths()["eval"] / "holdout_s1_ids.txt"
+    if path.exists():
+        return {l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()}
+    ids = list(truth.keys())
+    random.Random(cfg.seed).shuffle(ids)
+    n = max(5000, int(cfg.holdout_frac * len(ids)))
+    hold = set(ids[:n])
+    path.write_text("\n".join(sorted(hold)), encoding="utf-8")
+    return hold
+
+
+def block_country(cfg: Config, split: str, country: str, s1: pd.DataFrame, pool: pd.DataFrame):
+    t0 = time.time()
+    log(f"[{split}/{country}] blocking S1={len(s1):,} pool={len(pool):,}")
+    tf_cols, tf_sims = B.tfidf_block(s1["tokens"].tolist(), pool["tokens"].tolist(), cfg.tfidf_top_k, cfg.tfidf_max_df, cfg.tfidf_chunk)
+    key_cols, key_sims = B.key_block(
+        s1["keys"].tolist() if "keys" in s1.columns else [""] * len(s1),
+        pool["keys"].tolist() if "keys" in pool.columns else [""] * len(pool),
+        cfg.key_max_per,
+    )
+    emb_idx = emb_sims = None
+    q_vec = p_vec = None
+    if B.embeddings_available(cfg.use_embeddings):
+        emb_dir = cfg.paths()["emb"]
+        # Primary channel: name | addr
+        p_vec = B.embed_texts(
+            [B.embedding_text(a, b) for a, b in zip(pool["name_norm"], pool["addr_norm"])],
+            cfg.emb_model, cfg.emb_batch, cfg.emb_max_len, "passage: ",
+            emb_dir / f"{split}_pool_na_{country}_{cfg.block_version}.npy",
+        )
+        q_vec = B.embed_texts(
+            [B.embedding_text(a, b) for a, b in zip(s1["name_norm"], s1["addr_norm"])],
+            cfg.emb_model, cfg.emb_batch, cfg.emb_max_len, "query: ",
+            emb_dir / f"{split}_s1_na_{country}_{cfg.block_version}.npy",
+        )
+        emb_idx, emb_sims = B.dense_search(np.asarray(q_vec), np.asarray(p_vec), cfg.emb_top_k)
+
+        # Second channel: name-only (union with primary for higher pair recall)
+        if getattr(cfg, "emb_dual_channel", False):
+            log(f"[{split}/{country}] emb dual-channel: name-only union")
+            p_name = B.embed_texts(
+                [B.embedding_text_name(a) for a in pool["name_norm"]],
+                cfg.emb_model, cfg.emb_batch, cfg.emb_max_len, "passage: ",
+                emb_dir / f"{split}_pool_n_{country}_{cfg.block_version}.npy",
+            )
+            q_name = B.embed_texts(
+                [B.embedding_text_name(a) for a in s1["name_norm"]],
+                cfg.emb_model, cfg.emb_batch, cfg.emb_max_len, "query: ",
+                emb_dir / f"{split}_s1_n_{country}_{cfg.block_version}.npy",
+            )
+            emb_idx_n, emb_sims_n = B.dense_search(np.asarray(q_name), np.asarray(p_name), cfg.emb_top_k)
+            emb_idx, emb_sims = B.union_emb_topk(emb_idx, emb_sims, emb_idx_n, emb_sims_n, cfg.emb_top_k)
+            del p_name, q_name, emb_idx_n, emb_sims_n
+            gc.collect()
+
+    cs = B.merge_channels(len(s1), tf_cols, tf_sims, emb_idx, emb_sims, cfg.max_candidates, key_cols, key_sims)
+    if q_vec is not None and p_vec is not None and len(cs) > 0:
+        # Pair cosine always uses the richer name|addr vectors
+        cs.emb_sim = B.pair_embedding_similarity(np.asarray(q_vec), np.asarray(p_vec), cs.s1_idx, cs.pool_idx)
+    log(f"[{split}/{country}] candidates={len(cs):,} (avg {len(cs)/max(len(s1),1):.1f}/S1) in {time.time()-t0:.0f}s")
+    return cs
+
+
+def _inject_train_positives(
+    cs: B.CandidateSet,
+    s1_ids: np.ndarray,
+    pool_ids: np.ndarray,
+    truth: dict[str, set[str]],
+    exclude_s1: set[str] | None = None,
+) -> B.CandidateSet:
+    """Inject missed true pairs for fitting only. Holdout S1 IDs are never injected (honest ceiling)."""
+    exclude_s1 = exclude_s1 or set()
+    pool_pos = {str(pid): i for i, pid in enumerate(pool_ids)}
+    have: dict[int, set[int]] = defaultdict(set)
+    for i in range(len(cs)):
+        have[int(cs.s1_idx[i])].add(int(cs.pool_idx[i]))
+    add_s1, add_pool = [], []
+    for r, sid in enumerate(s1_ids):
+        if str(sid) in exclude_s1:
+            continue
+        for pid in truth.get(str(sid), ()):
+            j = pool_pos.get(str(pid))
+            if j is None:
+                continue
+            if j not in have[r]:
+                add_s1.append(r)
+                add_pool.append(j)
+                have[r].add(j)
+    if not add_s1:
+        return cs
+    n = len(add_s1)
+    log(f"  inject: +{n:,} missed true pairs (holdout excluded)")
+    return B.CandidateSet(
+        s1_idx=np.concatenate([cs.s1_idx, np.asarray(add_s1, dtype=np.int32)]),
+        pool_idx=np.concatenate([cs.pool_idx, np.asarray(add_pool, dtype=np.int32)]),
+        tfidf_sim=np.concatenate([cs.tfidf_sim, np.full(n, 0.35, dtype=np.float32)]),
+        tfidf_rank=np.concatenate([cs.tfidf_rank, np.full(n, 50, dtype=np.int16)]),
+        emb_sim=np.concatenate([cs.emb_sim, np.zeros(n, dtype=np.float32)]),
+        emb_rank=np.concatenate([cs.emb_rank, np.full(n, -1, dtype=np.int16)]),
+    )
+
+
+def build_country_block(
+    cfg: Config,
+    split: str,
+    country: str,
+    truth: dict[str, set[str]] | None,
+    s1_filter: set[str] | None = None,
+    holdout: set[str] | None = None,
+) -> Path:
+    """Block + featurise one country and store the result as npz. Reused if it exists."""
+    out = cfg.paths()["blocks"] / f"{split}_{country}_{cfg.block_version}.npz"
+    if out.exists():
+        log(f"[{split}/{country}] reuse {out.name}")
+        return out
+    prepared = cfg.paths()["prepared"]
+    s1 = load_prepared(prepared, split, 1, country)
+    if s1_filter is not None:
+        s1 = s1[s1["entity_id"].isin(s1_filter)].reset_index(drop=True)
+    pool = load_pool(prepared, split, country)
+    if len(s1) == 0 or len(pool) == 0:
+        np.savez(out, s1_ids=s1["entity_id"].to_numpy(dtype=object), pool_ids=np.empty(0, dtype=object), s1_idx=np.empty(0, np.int32), pool_idx=np.empty(0, np.int32), X=np.empty((0, len(PAIR_FEATURES)), np.float16), y=np.empty(0, np.int8))
+        return out
+    cs = block_country(cfg, split, country, s1, pool)
+    s1_ids = s1["entity_id"].to_numpy(dtype=object)
+    pool_ids = pool["entity_id"].to_numpy(dtype=object)
+    if truth is not None:
+        cs = _inject_train_positives(cs, s1_ids, pool_ids, truth, exclude_s1=holdout)
+        rec = B.blocking_recall(cs, s1_ids, pool_ids, truth)
+        log(f"[{split}/{country}] blocking recall: union={rec['recall_union']:.4f} tfidf={rec['recall_tfidf']:.4f} emb={rec['recall_emb']:.4f} (true pairs {rec['true_pairs']:,})")
+    t0 = time.time()
+    fz = PairFeaturizer(s1, pool, cfg.n_jobs)
+    X = fz.compute(cs).astype(np.float16)
+    log(f"[{split}/{country}] features {X.shape} in {time.time()-t0:.0f}s")
+    y = np.zeros(len(cs), dtype=np.int8)
+    if truth is not None:
+        pos_sets = [truth.get(str(s), set()) for s in s1_ids]
+        pid = pool_ids[cs.pool_idx]
+        sidx = cs.s1_idx
+        y = np.fromiter((1 if pid[i] in pos_sets[sidx[i]] else 0 for i in range(len(cs))), dtype=np.int8, count=len(cs))
+        log(f"[{split}/{country}] positives={int(y.sum()):,} pos_rate={y.mean():.4f}")
+    np.savez(out, s1_ids=s1_ids, pool_ids=pool_ids, s1_idx=cs.s1_idx, pool_idx=cs.pool_idx, X=X, y=y)
+    del fz, cs, X, s1, pool
+    gc.collect()
+    return out
+
+
+def _load_block(path: Path, keys: tuple[str, ...] | None = None) -> dict:
+    z = np.load(path, allow_pickle=True)
+    return {k: z[k] for k in (keys or z.files)}
+
+
+def _row_masks(z: dict, holdout: set[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pair holdout mask and per-pair hash bucket, computed per S1 id then broadcast."""
+    s1_ids = z["s1_ids"]
+    hold_id = np.fromiter((str(s) in holdout for s in s1_ids), dtype=bool, count=len(s1_ids))
+    bucket_id = _s1_hash_bucket(s1_ids)
+    return hold_id[z["s1_idx"]], bucket_id[z["s1_idx"]]
+
+
+def _sample_rows(mask: np.ndarray, quota: int, seed: int) -> np.ndarray:
+    rows = np.flatnonzero(mask)
+    if len(rows) > quota:
+        rows = np.sort(np.random.default_rng(seed).choice(rows, quota, replace=False))
+    return rows
+
+
+def _sample_rows_keep_pos(mask: np.ndarray, y: np.ndarray, quota: int, seed: int) -> np.ndarray:
+    """Always keep every positive under ``mask``; fill the rest of the quota with negatives."""
+    rows = np.flatnonzero(mask)
+    if len(rows) == 0:
+        return rows
+    pos = rows[y[rows] == 1]
+    neg = rows[y[rows] == 0]
+    if len(pos) >= quota:
+        return np.sort(pos)
+    need = quota - len(pos)
+    if len(neg) > need:
+        neg = np.random.default_rng(seed).choice(neg, need, replace=False)
+    return np.sort(np.concatenate([pos, neg]))
+
+
+# --------------------------------------------------------------------------------------
+# training
+# --------------------------------------------------------------------------------------
+
+def _lgb_params(cfg: Config, scale_pos_weight: float | None = None) -> dict:
+    p = {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "learning_rate": cfg.learning_rate,
+        "num_leaves": cfg.num_leaves,
+        "min_data_in_leaf": 80,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.85,
+        "bagging_freq": 1,
+        "lambda_l2": 1.0,
+        "max_bin": 255,
+        "verbosity": -1,
+        "num_threads": cfg.n_jobs,
+        "seed": cfg.seed,
+    }
+    spw = scale_pos_weight if scale_pos_weight is not None else cfg.scale_pos_weight
+    if spw and spw > 0:
+        p["scale_pos_weight"] = float(spw)
+    return p
+
+
+def _s1_hash_bucket(ids: np.ndarray) -> np.ndarray:
+    """Stable 0..99 bucket per S1 id (used for the early-stopping split)."""
+    return np.fromiter((int(hashlib.md5(str(s).encode()).hexdigest()[:6], 16) % 100 for s in ids), dtype=np.int16, count=len(ids))
+
+
+def run_train(cfg: Config) -> dict:
+    cfg.ensure_dirs()
+    P = cfg.paths()
+    gt_path = cfg.data_dir / "train" / "train_ground_truth.tsv"
+    truth = load_ground_truth(gt_path)
+    holdout = _holdout_ids(cfg, truth)
+    log(f"train: {len(truth):,} S1 entities, holdout={len(holdout):,}")
+
+    rng = random.Random(cfg.seed)
+    s1_filter = None
+    if cfg.train_s1_fraction < 1.0:
+        keep = {k for k in truth if k in holdout or rng.random() < cfg.train_s1_fraction}
+        s1_filter = keep
+        log(f"train: using {len(keep):,} S1 entities (fraction {cfg.train_s1_fraction})")
+
+    countries = list_countries(P["prepared"], "train")
+    block_paths = [build_country_block(cfg, "train", c, truth, s1_filter, holdout=holdout) for c in countries]
+
+    # ---------------- stage 1 (memory-bounded: sample rows per country) ----------------
+    n_total = 0
+    for bp in block_paths:
+        n_total += len(_load_block(bp, ("y",))["y"])
+    frac = min(1.0, cfg.stage1_max_rows / max(n_total, 1))
+    log(f"train: pairs total={n_total:,}; stage-1 uses ~{frac:.0%} of non-holdout pairs")
+    Xs, ys, bks = [], [], []
+    for bp in block_paths:
+        z = _load_block(bp)
+        if len(z["y"]) == 0:
+            continue
+        hold_mask, bucket = _row_masks(z, holdout)
+        rows = _sample_rows_keep_pos(~hold_mask, z["y"], int(frac * (~hold_mask).sum()) + 1, cfg.seed)
+        Xs.append(z["X"][rows]); ys.append(z["y"][rows]); bks.append(bucket[rows])
+        del z; gc.collect()
+    X = np.concatenate(Xs); y = np.concatenate(ys); bucket = np.concatenate(bks)
+    del Xs, ys, bks; gc.collect()
+    fit = bucket >= 10
+    log(f"stage1: fit rows={int(fit.sum()):,} early-stop rows={int((~fit).sum()):,} positives={int(y.sum()):,}")
+    d_tr = lgb.Dataset(X[fit].astype(np.float32), label=y[fit], feature_name=PAIR_FEATURES, free_raw_data=True)
+    d_va = lgb.Dataset(X[~fit].astype(np.float32), label=y[~fit], reference=d_tr, feature_name=PAIR_FEATURES)
+    m1 = lgb.train(_lgb_params(cfg), d_tr, num_boost_round=cfg.stage1_rounds, valid_sets=[d_va], callbacks=[lgb.early_stopping(80, verbose=False), lgb.log_evaluation(100)])
+    m1.save_model(str(P["model"] / "stage1.txt"))
+    log(f"stage1: best_iter={m1.best_iteration} logloss={m1.best_score['valid_0']['binary_logloss']:.5f}")
+    imp = sorted(zip(PAIR_FEATURES, m1.feature_importance("gain")), key=lambda x: -x[1])[:15]
+    log("stage1 top features: " + ", ".join(f"{k}={v:.0f}" for k, v in imp))
+    del d_tr, d_va, X, y, bucket; gc.collect()
+
+    # ---------------- stage 2 ensemble (competition features from stage-1 scores) ------
+    feat2 = PAIR_FEATURES + GROUP_FEATURES
+    Xs, ys, bks = [], [], []
+    for bp in block_paths:
+        z = _load_block(bp)
+        if len(z["y"]) == 0:
+            continue
+        p1 = _predict_chunked(m1, z["X"])
+        np.save(bp.with_suffix(".p1.npy"), p1)
+        G = group_features(z["s1_idx"], z["pool_idx"], p1)
+        hold_mask, bucket = _row_masks(z, holdout)
+        rows = _sample_rows_keep_pos(~hold_mask, z["y"], int(frac * (~hold_mask).sum()) + 1, cfg.seed + 1)
+        Xs.append(np.concatenate([z["X"][rows].astype(np.float32), G[rows]], axis=1).astype(np.float16))
+        ys.append(z["y"][rows]); bks.append(bucket[rows])
+        del z, p1, G; gc.collect()
+    X2 = np.concatenate(Xs); y2 = np.concatenate(ys); bucket = np.concatenate(bks)
+    del Xs, ys, bks; gc.collect()
+    fit = bucket >= 10
+    models2: list[lgb.Booster] = []
+    for k in range(max(1, cfg.ensemble_size)):
+        params = _lgb_params(cfg)
+        params["seed"] = cfg.seed + 17 * (k + 1)
+        params["feature_fraction_seed"] = cfg.seed + 31 * (k + 1)
+        params["bagging_seed"] = cfg.seed + 47 * (k + 1)
+        d_tr = lgb.Dataset(X2[fit].astype(np.float32), label=y2[fit], feature_name=feat2, free_raw_data=False)
+        d_va = lgb.Dataset(X2[~fit].astype(np.float32), label=y2[~fit], reference=d_tr, feature_name=feat2)
+        m2 = lgb.train(params, d_tr, num_boost_round=cfg.stage2_rounds, valid_sets=[d_va], callbacks=[lgb.early_stopping(60, verbose=False), lgb.log_evaluation(100)])
+        m2.save_model(str(P["model"] / f"stage2_{k}.txt"))
+        log(f"stage2[{k}]: best_iter={m2.best_iteration} logloss={m2.best_score['valid_0']['binary_logloss']:.5f}")
+        models2.append(m2)
+        del d_tr, d_va
+    # keep legacy stage2.txt as first model for compatibility
+    models2[0].save_model(str(P["model"] / "stage2.txt"))
+    del X2, y2, bucket
+    gc.collect()
+
+    # ---------------- holdout predictions + threshold (global + per-country) -----------
+    country_of: dict[str, str] = {}
+    hold_blobs: list[dict] = []
+    for bp, country in zip(block_paths, countries):
+        z = _load_block(bp)
+        for s in z["s1_ids"]:
+            if str(s) in holdout:
+                country_of[str(s)] = country
+        if len(z["y"]) == 0:
+            continue
+        p1 = np.load(bp.with_suffix(".p1.npy"))
+        G = group_features(z["s1_idx"], z["pool_idx"], p1)
+        hold_mask, _ = _row_masks(z, holdout)
+        rows = np.flatnonzero(hold_mask)
+        if len(rows) == 0:
+            del z, p1, G
+            gc.collect()
+            continue
+        Xh = np.concatenate([z["X"][rows].astype(np.float32), G[rows]], axis=1)
+        p2 = _predict_ensemble(models2, Xh)
+        hold_blobs.append({
+            "country": country,
+            "s1_ids": z["s1_ids"],
+            "pool_ids": z["pool_ids"],
+            "s1_idx": z["s1_idx"][rows],
+            "pool_idx": z["pool_idx"][rows],
+            "X": z["X"][rows],
+            "p2": p2,
+            "hold_s1": {str(s) for s in z["s1_ids"] if str(s) in holdout},
+        })
+        del z, p1, G, p2, Xh
+        gc.collect()
+
+    truth_hold = {s: truth[s] for s in holdout if s in truth}
+    margin = cfg.rescue_margin
+    fill = cfg.singleton_fill
+
+    def _eval_at(threshold: float) -> float:
+        scores: dict[str, list[tuple[str, float]]] = {s: [] for s in truth_hold}
+        all_sc: dict[str, list[tuple[str, float]]] = {s: [] for s in truth_hold}
+        for blob in hold_blobs:
+            p = apply_score_rescue(blob["p2"], blob["X"], threshold, margin)
+            part = _scores_from_arrays(blob["s1_ids"], blob["pool_ids"], blob["s1_idx"], blob["pool_idx"], p, threshold)
+            full = _all_scores_from_arrays(blob["s1_ids"], blob["pool_ids"], blob["s1_idx"], blob["pool_idx"], p)
+            for sid, pairs in part.items():
+                if sid in scores:
+                    scores[sid].extend(pairs)
+            for sid, pairs in full.items():
+                if sid in all_sc:
+                    all_sc[sid].extend(pairs)
+        return macro_f05(decide(scores, threshold, singleton_fill=fill, all_scores=all_sc), truth_hold)
+
+    best_t, best_f = 0.5, -1.0
+    sweep = []
+    for t in np.arange(0.15, 0.96, 0.01):
+        f = _eval_at(float(t))
+        sweep.append((round(float(t), 2), round(f, 5)))
+        if f > best_f:
+            best_f, best_t = f, float(t)
+
+    country_thr: dict[str, float] = {}
+    for country in countries:
+        c_ids = {s for s, c in country_of.items() if c == country}
+        truth_c = {s: truth_hold[s] for s in c_ids if s in truth_hold}
+        if len(truth_c) < 200:
+            continue
+        bt, bf = best_t, -1.0
+        for t in np.arange(max(0.12, best_t - 0.20), min(0.95, best_t + 0.20) + 1e-9, 0.01):
+            scores = {s: [] for s in truth_c}
+            for blob in hold_blobs:
+                if blob["country"] != country:
+                    continue
+                p = apply_score_rescue(blob["p2"], blob["X"], float(t), margin)
+                part = _scores_from_arrays(blob["s1_ids"], blob["pool_ids"], blob["s1_idx"], blob["pool_idx"], p, float(t))
+                for sid, pairs in part.items():
+                    if sid in scores:
+                        scores[sid].extend(pairs)
+            f = macro_f05(decide(scores, float(t)), truth_c)
+            if f > bf:
+                bf, bt = f, float(t)
+        country_thr[country] = round(bt, 2)
+        log(f"holdout[{country}]: threshold={bt:.2f} F0.5={bf:.4f} (n={len(truth_c):,})")
+
+    scores_final: dict[str, list[tuple[str, float]]] = {s: [] for s in truth_hold}
+    all_final: dict[str, list[tuple[str, float]]] = {s: [] for s in truth_hold}
+    for blob in hold_blobs:
+        thr = country_thr.get(blob["country"], best_t)
+        p = apply_score_rescue(blob["p2"], blob["X"], thr, margin)
+        part = _scores_from_arrays(blob["s1_ids"], blob["pool_ids"], blob["s1_idx"], blob["pool_idx"], p, thr)
+        full = _all_scores_from_arrays(blob["s1_ids"], blob["pool_ids"], blob["s1_idx"], blob["pool_idx"], p)
+        for sid, pairs in part.items():
+            if sid in scores_final:
+                scores_final[sid].extend(pairs)
+        for sid, pairs in full.items():
+            if sid in all_final:
+                all_final[sid].extend(pairs)
+    preds = decide(
+        scores_final,
+        min(country_thr.values()) if country_thr else best_t,
+        singleton_fill=fill,
+        all_scores=all_final,
+    )
+    report = detailed_report(preds, truth_hold, country_of)
+    report["threshold"] = round(best_t, 2)
+    report["country_thresholds"] = country_thr
+    report["rescue_margin"] = margin
+    report["singleton_fill"] = cfg.singleton_fill
+    report["threshold_sweep"] = sweep
+    best_f = report["macro_f05"]
+    log(f"holdout: best threshold={best_t:.2f} macro F0.5={best_f:.4f} | pair P={report['pair_precision']:.4f} R={report['pair_recall']:.4f} | per-country={report.get('per_country_f05')}")
+
+    write_predictions(P["eval"] / "holdout_predictions_v2.tsv", sorted(truth_hold), preds)
+    (P["eval"] / "holdout_report_v2.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    meta = {
+        "threshold": round(best_t, 2),
+        "country_thresholds": country_thr,
+        "rescue_margin": margin,
+        "singleton_fill": cfg.singleton_fill,
+        "holdout_macro_f05": best_f,
+        "pair_features": PAIR_FEATURES,
+        "group_features": GROUP_FEATURES,
+        "stage1_best_iter": m1.best_iteration,
+        "stage2_best_iters": [m.best_iteration for m in models2],
+        "ensemble_size": len(models2),
+        "use_embeddings": B.embeddings_available(cfg.use_embeddings),
+        "emb_model": cfg.emb_model,
+        "version": "2.3.0-final-dual",
+        "emb_dual_channel": bool(getattr(cfg, "emb_dual_channel", False)),
+        "profile": cfg.profile,
+        "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()},
+    }
+    (P["model"] / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return report
+
+
+def _feat_col(name: str) -> int:
+    return PAIR_FEATURES.index(name)
+
+
+def apply_score_rescue(p2: np.ndarray, X: np.ndarray, threshold: float, margin: float) -> np.ndarray:
+    """Boost / admit high-confidence pairs that the tree under-scored (v2 under-matched vs GT)."""
+    if len(p2) == 0:
+        return p2
+    Xf = X.astype(np.float32, copy=False)
+    n_exact = Xf[:, _feat_col("n_core_exact")] > 0.5
+    n_comp = Xf[:, _feat_col("n_compact_exact")] > 0.5
+    postal_ok = Xf[:, _feat_col("a_postal_state")] > 0
+    name_hi = Xf[:, _feat_col("n_core_token_set")]
+    gap = Xf[:, _feat_col("name_addr_gap")]
+    both = Xf[:, _feat_col("both_postal_name")] > 0.5
+    emb = Xf[:, _feat_col("emb_sim")]
+    out = p2.copy()
+    hard = (n_exact | n_comp) & (postal_ok | ((name_hi >= 0.90) & (gap < 0.35)))
+    out = np.where(hard, np.maximum(out, max(0.94, threshold)), out)
+    soft = both & (out >= threshold - margin) & (out < threshold) & (gap < 0.45)
+    out = np.where(soft, threshold, out)
+    soft2 = (name_hi >= 0.96) & (out >= threshold - 0.75 * margin) & (out < threshold) & (gap < 0.30)
+    out = np.where(soft2, threshold, out)
+    # embedding-strong + decent name, near threshold
+    soft3 = (emb >= 0.82) & (name_hi >= 0.80) & (gap < 0.35) & (out >= threshold - margin) & (out < threshold)
+    out = np.where(soft3, threshold, out)
+    return out
+
+
+def _predict_chunked(model: lgb.Booster, X, chunk: int = 2_000_000) -> np.ndarray:
+    out = np.empty(len(X), dtype=np.float32)
+    for s in range(0, len(X), chunk):
+        out[s : s + chunk] = model.predict(np.asarray(X[s : s + chunk], dtype=np.float32), num_iteration=model.best_iteration or None)
+    return out
+
+
+def _predict_ensemble(models: list[lgb.Booster], X) -> np.ndarray:
+    out = np.zeros(len(X), dtype=np.float64)
+    for m in models:
+        out += _predict_chunked(m, X)
+    return (out / max(len(models), 1)).astype(np.float32)
+
+
+# --------------------------------------------------------------------------------------
+# decision
+# --------------------------------------------------------------------------------------
+
+def decide(
+    scores: dict[str, list[tuple[str, float]]],
+    threshold: float,
+    singleton_fill: float = 0.0,
+    all_scores: dict[str, list[tuple[str, float]]] | None = None,
+) -> dict[str, set[str]]:
+    """Threshold + one-to-one assignment + per-source cap.
+
+    If ``singleton_fill`` > 0 and an S1 has no matches above threshold, admit its single
+    best candidate when score >= threshold - singleton_fill (reduces empty over-prediction).
+    ``all_scores`` should contain unfiltered pairs when fill is used; defaults to ``scores``.
+    """
+    claims: dict[str, tuple[str, float]] = {}
+    for sid, pairs in scores.items():
+        for cid, p in pairs:
+            if p < threshold:
+                continue
+            prev = claims.get(cid)
+            if prev is None or p > prev[1]:
+                claims[cid] = (sid, p)
+
+    # singleton fill before building final sets (also respects one-to-one)
+    if singleton_fill > 0:
+        pool = all_scores or scores
+        floor = threshold - singleton_fill
+        for sid, pairs in pool.items():
+            if not pairs:
+                continue
+            # already has a claimed match for this sid?
+            has = any(claims.get(cid, (None, 0))[0] == sid for cid, _ in pairs if claims.get(cid, (None, 0))[0] == sid)
+            # cheaper: check if any claim maps to sid
+            if any(v[0] == sid for v in claims.values()):
+                continue
+            best_cid, best_p = max(pairs, key=lambda x: x[1])
+            if best_p < floor:
+                continue
+            prev = claims.get(best_cid)
+            if prev is None or best_p > prev[1]:
+                claims[best_cid] = (sid, best_p)
+
+    by_s1: dict[str, list[tuple[float, str]]] = defaultdict(list)
+    for cid, (sid, p) in claims.items():
+        by_s1[sid].append((p, cid))
+    out: dict[str, set[str]] = {sid: set() for sid in scores}
+    for sid, lst in by_s1.items():
+        lst.sort(reverse=True)
+        n2 = n3 = 0
+        chosen = set()
+        for p, cid in lst:
+            if cid.startswith("S2-"):
+                if n2 >= MAX_PER_SOURCE:
+                    continue
+                n2 += 1
+            else:
+                if n3 >= MAX_PER_SOURCE:
+                    continue
+                n3 += 1
+            chosen.add(cid)
+        out[sid] = chosen
+    return out
+
+
+def write_predictions(path: Path, s1_order: list[str], preds: dict[str, set[str]], header: str = "matched_entity_ids") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"source1_entity_id\t{header}\n")
+        for sid in s1_order:
+            f.write(f"{sid}\t{','.join(sorted(preds.get(sid, set())))}\n")
+
+
+def _scores_from_arrays(s1_ids, pool_ids, s1_idx, pool_idx, p, threshold: float) -> dict[str, list[tuple[str, float]]]:
+    keep = np.flatnonzero(p >= threshold - 1e-9)
+    scores: dict[str, list[tuple[str, float]]] = {str(s): [] for s in s1_ids}
+    for i in keep:
+        scores[str(s1_ids[s1_idx[i]])].append((str(pool_ids[pool_idx[i]]), float(p[i])))
+    return scores
+
+
+def _all_scores_from_arrays(s1_ids, pool_ids, s1_idx, pool_idx, p) -> dict[str, list[tuple[str, float]]]:
+    """Unfiltered scores (for singleton fill). Keep top few per S1 by score."""
+    order = np.argsort(-p)
+    scores: dict[str, list[tuple[str, float]]] = {str(s): [] for s in s1_ids}
+    counts: dict[str, int] = defaultdict(int)
+    for i in order:
+        sid = str(s1_ids[s1_idx[i]])
+        if counts[sid] >= 8:
+            continue
+        scores[sid].append((str(pool_ids[pool_idx[i]]), float(p[i])))
+        counts[sid] += 1
+    return scores
+
+
+# --------------------------------------------------------------------------------------
+# prediction on the test split
+# --------------------------------------------------------------------------------------
+
+def run_predict(cfg: Config, split: str = "test") -> None:
+    cfg.ensure_dirs()
+    P = cfg.paths()
+    m1 = lgb.Booster(model_file=str(P["model"] / "stage1.txt"))
+    meta = json.loads((P["model"] / "meta.json").read_text(encoding="utf-8"))
+    n_ens = int(meta.get("ensemble_size", 1))
+    models2 = []
+    for k in range(n_ens):
+        path = P["model"] / f"stage2_{k}.txt"
+        if not path.exists() and k == 0:
+            path = P["model"] / "stage2.txt"
+        models2.append(lgb.Booster(model_file=str(path)))
+    default_thr = cfg.threshold if cfg.threshold is not None else float(meta["threshold"])
+    country_thr = {k: float(v) for k, v in (meta.get("country_thresholds") or {}).items()}
+    margin = float(meta.get("rescue_margin", cfg.rescue_margin))
+    fill = float(meta.get("singleton_fill", cfg.singleton_fill))
+    log(f"predict[{split}]: default_threshold={default_thr} country_thr={country_thr} rescue={margin} fill={fill} ensemble={len(models2)}")
+
+    s1_order = read_tsv(cfg.data_dir / split / f"{split}_source1.tsv", usecols=["entity_id"])["entity_id"].tolist()
+    preds: dict[str, set[str]] = {}
+    cand_str: dict[str, str] = {}
+
+    for country in list_countries(P["prepared"], split):
+        bp = build_country_block(cfg, split, country, None)
+        z = _load_block(bp)
+        if len(z["s1_idx"]) == 0:
+            continue
+        p1 = _predict_chunked(m1, z["X"])
+        G = group_features(z["s1_idx"], z["pool_idx"], p1)
+        p2 = _predict_ensemble(models2, np.concatenate([z["X"].astype(np.float32), G], axis=1))
+        thr = country_thr.get(country, default_thr)
+        p2 = apply_score_rescue(p2, z["X"], thr, margin)
+        s1_ids, pool_ids, s1_idx, pool_idx = z["s1_ids"], z["pool_ids"], z["s1_idx"], z["pool_idx"]
+        order = np.argsort(s1_idx, kind="stable")
+        bounds = np.flatnonzero(np.r_[True, s1_idx[order][1:] != s1_idx[order][:-1], True])
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            rows = order[a:b]
+            cand_str[str(s1_ids[s1_idx[rows[0]]])] = ",".join(str(pool_ids[j]) for j in pool_idx[rows])
+        scores = _scores_from_arrays(s1_ids, pool_ids, s1_idx, pool_idx, p2, thr)
+        all_sc = _all_scores_from_arrays(s1_ids, pool_ids, s1_idx, pool_idx, p2) if fill > 0 else None
+        preds.update(decide(scores, thr, singleton_fill=fill, all_scores=all_sc))
+        log(f"predict[{split}/{country}]: scored {len(p2):,} pairs, thr={thr:.2f}")
+        del z, p1, G, p2, scores
+        gc.collect()
+
+    out_match = cfg.output_dir / "matching_results.tsv"
+    out_cand = cfg.output_dir / "candidate_pairs.tsv"
+    write_predictions(out_match, s1_order, preds)
+    with open(out_cand, "w", encoding="utf-8", newline="\n") as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for sid in s1_order:
+            f.write(f"{sid}\t{cand_str.get(sid, '')}\n")
+    n_empty = sum(1 for s in s1_order if not preds.get(s))
+    log(f"predict[{split}]: wrote {out_match} ({len(s1_order):,} rows, {n_empty/len(s1_order):.3%} empty) and {out_cand}")

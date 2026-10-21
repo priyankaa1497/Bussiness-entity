@@ -1,0 +1,17 @@
+work/
+work_sample/
+output/
+output_sample/
+data_sample/
+DATASET/
+dataset/
+data/
+*.tsv
+*.csv
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.npz
+*.npy
+*.log

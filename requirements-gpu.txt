@@ -1,0 +1,7 @@
+# Optional dense-embedding blocking channel (recommended when a CUDA GPU is available).
+# Install PyTorch FIRST with the CUDA build matching your driver, e.g. (CUDA 12.x):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# then:
+#   pip install -r requirements-gpu.txt
+sentence-transformers==6.1.0
+faiss-cpu==1.15.1
