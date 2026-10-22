@@ -1,4 +1,4 @@
-# Business Entity Resolution — FINAL
+# Business Entity Resolution - FINAL
 
 Amazon ML Challenge 2026. Builds on the pipeline that scored **0.887305** on the public leaderboard (TF-IDF + exact keys + `multilingual-e5-small` + two-stage LightGBM), and pushes recall toward **0.95 F0.5**.
 
